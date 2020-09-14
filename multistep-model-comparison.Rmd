@@ -1,0 +1,383 @@
+---
+output: 
+  pdf_document:
+    keep_tex: true
+    fig_caption: true
+    latex_engine: pdflatex
+header-includes:
+  -  \usepackage{hyperref}  
+title: "Multistep Model of Parkinson's"
+geometry: margin=2cm
+
+---
+
+## R Setup
+
+```{r setup, include=FALSE}
+
+library(rstan)
+library(posterior)
+library(bayesplot)
+library(bridgesampling)
+library(cowplot)
+library(forcats)
+color_scheme_set("brightblue")
+
+Sys.setenv(MAKEFLAGS = "-j6")
+rstan_options(auto_write=TRUE)
+options(mc.cores=parallel::detectCores ())
+
+SEED=17610407
+```
+
+## Data import
+
+```{r data, message=FALSE}
+
+ages_100 <- c("30","35","40","45",
+              "50","55","60","65","70","75","80","85",
+              "90","95","100+")
+
+sim_df_ms_full <- read.csv("data/incidence_by_age_multistep_full.csv") %>%
+  mutate(agecut5 = fct_relevel(agecut5,ages_100)) %>%
+  mutate(agecut5_scaled = agecut5_log-min(agecut5_log))
+
+sim_df_ms_sex_full <- read.csv("data/incidence_by_age_multistep_sex_full.csv") %>%
+  mutate(agecut5 = fct_relevel(agecut5,ages_100)) %>%
+  filter(agecut5_numeric >= 30) %>%
+  mutate(agecut5_scaled = agecut5_log-min(agecut5_log))
+
+sim_df_ms_model <- sim_df_ms_full %>%
+  filter(agecut5_numeric <= 80) 
+  
+sim_df_ms_sex_model <- sim_df_ms_sex_full %>%
+  filter(agecut5_numeric <= 80)
+  
+```
+
+## Model: Linear
+
+
+```{r model_linear, message=FALSE}
+mod_ms_linear <- stan_model('stan/multistep_linear.stan')
+
+pars_linear <- c('m','c','sigma_sq')
+
+data_list_linear <- list(m_prior_mean = 6,
+                  m_prior_sd = 1,
+                  N=nrow(sim_df_ms_model),
+                  x = sim_df_ms_model$agecut5_scaled, 
+                  y_min = sim_df_ms_model$lower_log,
+                  y_max = sim_df_ms_model$upper_log)
+
+fit_linear <- sampling(mod_ms_linear, data = data_list_linear, seed = SEED,
+                   pars = pars_linear, chains = 4, iter = 2000,
+                   control = list(max_treedepth = 15,adapt_delta=0.99),
+                   verbose=TRUE)
+
+print(fit_linear)
+
+H_LINEAR = bridge_sampler(fit_linear)
+
+```
+
+## Model: Broken-stick
+
+```{r model_broken_stick, message=FALSE}
+
+mod_ms_bs <- stan_model('stan/multistep_brokenstick.stan')
+
+pars_bs <- c('m_early','m_late','bp','c','sigma_sq')
+
+# wider priors for estimation
+data_list_bs <- list(m_early_prior_mean = 5,
+                     m_early_prior_sd = 1,
+                     m_late_prior_mean = 7,
+                     m_late_prior_sd = 1,
+                     bp_prior_mean = 0.5,
+                     bp_prior_sd = 0.3,
+                     N=nrow(sim_df_ms_model),
+                     x = sim_df_ms_model$agecut5_scaled, 
+                     y_min = sim_df_ms_model$lower_log,
+                     y_max = sim_df_ms_model$upper_log)
+
+fit_bs <- sampling(mod_ms_bs, data = data_list_bs, seed = SEED,
+                  pars = pars_bs, chains = 4, iter = 2000,
+                  control = list(max_treedepth = 15,adapt_delta=0.99),
+                  verbose=TRUE)
+
+print(fit_bs)
+
+## Run in console
+#pdf("plots/bs_pairs_diagnosis.pdf")
+#pairs(fit_bs)
+#dev.off()
+
+H_BS = bridge_sampler(fit_bs)
+
+bf_bs = bf(H_BS,H_LINEAR)
+
+```
+
+## Model: Sex Broken-stick
+
+```{r model_broken_stick, message=FALSE}
+
+# Common slope and intercept by sex
+mod_ms_bs_sex_common <- stan_model('stan/multistep_brokenstick.stan')
+pars_bs_sex_common <- c('m_early','m_late','bp','c','sigma_sq')
+
+# Allow intercept vary by sex
+mod_ms_bs_sex_vc <- stan_model('stan/multistep_brokenstick_sex_intercept.stan')
+pars_bs_sex_vmc <- c('m_early','m_late','bp','c','c_sex','m_sex','sigma_sq')
+
+# Allow slope and intercept to vary by sex
+mod_ms_bs_sex_vmc <- stan_model('stan/multistep_brokenstick_sex.stan')
+pars_bs_sex_vc <- c('m_early','m_late','bp','c','c_sex','sigma_sq')
+
+# data and priors - varying intercept/slope
+data_list_bs_sex <- list(m_early_prior_mean = 5,
+                     m_early_prior_sd = 1,
+                     m_late_prior_mean = 7,
+                     m_late_prior_sd = 1,
+                     bp_prior_mean = 0.5,
+                     bp_prior_sd = 0.3,
+                     N=nrow(sim_df_ms_sex_model),
+                     x = sim_df_ms_sex_model$agecut5_scaled,
+                     sex = abs(as.numeric(factor(sim_df_ms_sex_model$sex))-2),
+                     y_min = sim_df_ms_sex_model$lower_log,
+                     y_max = sim_df_ms_sex_model$upper_log)
+
+# Common slope and intercept to vary by sex
+fit_bs_sex_common <- sampling(mod_ms_bs_sex_common, data = data_list_bs_sex, 
+                  seed = SEED,
+                  pars = pars_bs_sex_common, chains = 4, iter = 2000,
+                  control = list(max_treedepth = 20,adapt_delta=0.99),
+                  verbose=TRUE)
+
+print(fit_bs_sex_common)
+
+# Allow intercept to vary by sex
+fit_bs_sex_vc <- sampling(mod_ms_bs_sex_vc, data = data_list_bs_sex, 
+                  seed = SEED,
+                  pars = pars_bs_sex_vc, chains = 4, iter = 2000,
+                  control = list(max_treedepth = 20,adapt_delta=0.99),
+                  verbose=TRUE)
+
+print(fit_bs_sex_vc)
+
+# Allow slope and intercept to vary by sex
+fit_bs_sex_vmc <- sampling(mod_ms_bs_sex_vmc, data = data_list_bs_sex, 
+                  seed = SEED,
+                  pars = pars_bs_sex_vmc, chains = 4, iter = 2000,
+                  control = list(max_treedepth = 20,adapt_delta=0.99),
+                  verbose=TRUE)
+
+print(fit_bs_sex_vmc)
+
+## DIAGNOSITICS
+## Run in console
+#pdf("plots/sex_pairs_diagnosis.pdf")
+#pairs(fit_bs_sex_vmc)
+#dev.off()
+
+H_BS_SEX_COMMON = bridge_sampler(fit_bs_sex_common)
+H_BS_SEX_VC = bridge_sampler(fit_bs_sex_vc)
+H_BS_SEX_VMC = bridge_sampler(fit_bs_sex_vmc)
+
+bf(H_BS_SEX_VC,H_BS_SEX_COMMON)
+bf(H_BS_SEX_VMC,H_BS_SEX_VC)
+
+```
+
+
+## Plot: Age-specific incidence non-log
+
+```{r age-specific-incidence-figure, fig.width = 18/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+fig2_age_specific_incidence <- sim_df_ms_full %>%
+  ggplot(aes(x=agecut5,y=middle,group="incidence"))+
+  geom_ribbon(aes(ymin=lower,ymax=upper),alpha=0.3)+
+  scale_x_discrete("Age", labels = c("30","",
+                                     "40","","50","",
+                                     "60","","70","",
+                                     "80","","90","",
+                                     "100+"
+  ))+
+  geom_line(size=0.2)+geom_point(size=2,fill="grey")+
+  ylab("Incidence\n(per 100 000 per year)")+
+  scale_shape_manual(values=c(21))+
+  xlab("Age")+ theme(legend.position = "none")+
+  annotate("text",x=1,y=300,label="A")
+
+plot(fig2_age_specific_incidence)
+ggsave("plots/multistep-incidence-by-age.pdf",width=5,height=3)
+ggsave("plots/multistep-incidence-by-age.png",width=5,height=3)
+```
+
+## Plot: Age-specific incidence by sex non-log
+
+```{r age-sex-specific-incidence-figure, fig.width = 18/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+fig2_age_sex_specific_incidence <- sim_df_ms_sex_full %>%
+  ggplot(aes(x=agecut5,y=middle,group="incidence"))+
+  geom_ribbon(aes(ymin=lower,ymax=upper),alpha=0.3)+
+  facet_wrap(~sex)+
+  scale_x_discrete("Age", labels = c("30","",
+                                     "40","","50","",
+                                     "60","","70","",
+                                     "80","","90","",
+                                     "100+"
+  ))+
+  geom_line(size=0.2)+geom_point(size=2,fill="grey")+
+  ylab("Incidence\n(per 100 000 per year)")+
+  scale_shape_manual(values=c(21))+
+  xlab("Age")+ theme(legend.position = "none")+
+  annotate("text",x=1,y=300,label="A")
+
+plot(fig2_age_sex_specific_incidence)
+ggsave("plots/multistep-incidence-by-sex-age.pdf",width=5,height=3)
+ggsave("plots/multistep-incidence-by-sex-age.png",width=5,height=3)
+```
+
+## Plot: Linear model
+
+```{r linear-figure, fig.width = 18/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+# Extract fitted values from model
+values_l = summary(fit_linear)$summary
+
+start=0.0
+end = max(sim_df_ms_model$agecut5_scaled)
+m = values_l[1,1]
+c = values_l[2,1]
+
+fig2_log_linear <- sim_df_ms_full %>%
+  ggplot(aes(x=agecut5_scaled,y=middle_log,group=type))+
+  geom_errorbar(aes(ymin=lower_log,ymax=upper_log), width=0)+
+  ylab("Log Incidence\n(per 100 000 per year)")+
+  xlab("log(Age) - log(30)")+ theme(legend.position = "none")+
+  geom_segment(x=start,y=c+m*start,
+               xend=end,yend=c+m*end,colour="#CC79A7")+
+  geom_point(size=2,fill="grey")+
+  annotate("text",x=0,y=5,label="B")
+
+plot(fig2_log_linear)
+ggsave("plots/multistep-log-relationship.pdf",width=6,height=4)
+ggsave("plots/multistep-log-relationship.png",width=6,height=4)
+
+```
+
+
+## Plot: Broken-stick model
+
+```{r broken-stick-figure, fig.width = 18/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+# Extract fitted values from model
+values_bs = summary(fit_bs)$summary
+
+m_early=values_bs[1,1]
+m_late=values_bs[2,1]
+bp=values_bs[3,1]
+c=values_bs[4,1]
+
+offset = 0.25
+
+x1 = start
+y1 = c+m_early*x1
+
+x2 = bp
+y2 = c+m_early*x2
+
+x2a = bp+offset
+y2a = c+m_early*x2a
+
+x2b = bp-offset
+y2b = y2-m_late*offset
+
+x3 = end
+y3 = y2+(end-bp)*m_late
+
+fig2_log_broken_stick <- sim_df_ms_full %>%
+  ggplot(aes(x=agecut5_scaled,y=middle_log,group=type))+
+  geom_errorbar(aes(ymin=lower_log,ymax=upper_log), width=0)+
+  ylab("Log Incidence\n(per 100 000 per year)")+
+  xlab("log(Age) - log(30)")+ theme(legend.position = "none")+
+  geom_segment(x=x1,y=y1,
+               xend=x2,yend=y2,colour="#56B4E9")+
+  geom_segment(x=x2,y=y2,
+               xend=x2a,yend=y2a,colour="#56B4E9",linetype="dotted")+
+  geom_segment(x=x2b,y=y2b,
+               xend=x2,yend=y2,colour="#E69F00",linetype="dotted")+
+  geom_segment(x=x2,y=y2,
+               xend=x3,yend=y3,colour="#E69F00")+
+  geom_point(size=2,fill="grey")+
+  annotate("text",x=0,y=5,label="C")
+
+plot(fig2_log_broken_stick)
+ggsave("plots/multistep-log-relationship-bs.pdf",width=6,height=4)
+ggsave("plots/multistep-log-relationship-bs.png",width=6,height=4)
+
+```
+
+
+## Plot:  mean age-specific by sex
+
+```{r broken-stick-sex-figure, fig.width = 18/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+# Extract fitted values from model
+values_bs = summary(fit_bs_sex_vc)$summary
+
+m_early=values_bs[1,1]
+m_late=values_bs[2,1]
+bp=values_bs[3,1]
+c=values_bs[4,1]
+c_sex=values_bs[5,1]
+
+colours_mf <- c("#009E73", "#D55E00")
+
+fig2_log_sex <- sim_df_ms_sex_full %>%
+  mutate(sex = factor(sex,levels=c("Male","Female"))) %>%
+  filter(agecut5_numeric >= 30) %>%
+  ggplot(aes(x=agecut5_scaled,y=middle_log,group=sex,shape=sex,colour=sex))+
+  geom_errorbar(aes(ymin=lower_log,ymax=upper_log), width=0)+
+  ylab("Log Incidence\n(per 100 000 per year)")+
+  xlab("log(Age) - log(30)")+ theme(legend.position = c(0.8,0.2),
+                         legend.title = element_blank())+
+  scale_color_manual(values = colours_mf)+
+  geom_segment(x=start,y=c+m_early*start,
+               xend=bp,yend=c+m_early*bp,colour=colours_mf[1])+
+  geom_segment(x=bp,y=c+m_early*bp,
+               xend=end,yend=c+m_early*bp+(end-bp)*m_late,colour=colours_mf[1])+
+  geom_segment(x=start,y=c+c_sex+m_early*start,
+               xend=bp,yend=c+c_sex+m_early*bp,colour=colours_mf[2])+
+  geom_segment(x=bp,y=c+c_sex+m_early*bp,
+               xend=end,yend=c+c_sex+m_early*bp+(end-bp)*m_late,colour=colours_mf[2])+
+  geom_point(size=2)+
+  annotate("text",x=0,y=5,label="D")
+
+
+print(fig2_log_sex)
+
+ggsave("plots/multistep-log-relationship-sex.pdf",width=6,height=4)
+ggsave("plots/multistep-log-relationship-sex.png",width=6,height=4)
+```
+
+## Plot: Figure 2
+
+```{r figure2, fig.width = 8/2.54, fig.height = 20/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+figure_2 = cowplot::plot_grid(fig2_age_specific_incidence,
+                              fig2_log_linear,
+                              fig2_log_broken_stick, 
+                              fig2_log_sex, 
+                              align = 'v',
+                              axis = 'bt', ncol = 1)
+
+plot(figure_2)
+ggsave("plots/multistep-figure-2.pdf",width=4,height=10)
+ggsave("plots/multistep-figure-2.png",width=4,height=10)
+
+```
+
+

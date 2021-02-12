@@ -15,12 +15,14 @@ geometry: margin=2cm
 
 ```{r setup, include=FALSE}
 
+library(dplyr)
 library(rstan)
 library(posterior)
 library(bayesplot)
 library(bridgesampling)
 library(cowplot)
 library(forcats)
+
 color_scheme_set("brightblue")
 
 Sys.setenv(MAKEFLAGS = "-j6")
@@ -34,26 +36,56 @@ SEED=17610407
 
 ```{r data, message=FALSE}
 
-ages_100 <- c("30","35","40","45",
-              "50","55","60","65","70","75","80","85",
-              "90","95","100+")
+ages_100 <- c("30","35","40","45","50","55",
+              "60","65","70","75","80",
+              "85","90","95","100+")
 
 sim_df_ms_full <- read.csv("data/incidence_by_age_multistep_full.csv") %>%
   mutate(agecut5 = fct_relevel(agecut5,ages_100)) %>%
-  mutate(agecut5_scaled = agecut5_log-min(agecut5_log))
+  mutate(agecut5_scaled = agecut5_log-min(agecut5_log)) %>%
+  mutate(restriction = if_else(agecut5_numeric<=80,"modelled","unmodelled"))
 
 sim_df_ms_sex_full <- read.csv("data/incidence_by_age_multistep_sex_full.csv") %>%
   mutate(agecut5 = fct_relevel(agecut5,ages_100)) %>%
   filter(agecut5_numeric >= 30) %>%
-  mutate(agecut5_scaled = agecut5_log-min(agecut5_log))
+  mutate(agecut5_scaled = agecut5_log-min(agecut5_log)) %>%
+  mutate(restriction = if_else(agecut5_numeric<=80,"modelled","unmodelled")) %>%
+  mutate(sex_restriction = factor(sex):factor(restriction)) %>%
+  mutate(sex = factor(sex,levels=c("Male","Female"))) %>%
+  mutate(sex_restriction = factor(sex_restriction,
+                levels=c("Male:modelled","Female:modelled",
+                 "Male:unmodelled","Female:unmodelled")))
 
 sim_df_ms_model <- sim_df_ms_full %>%
   filter(agecut5_numeric <= 80) 
   
 sim_df_ms_sex_model <- sim_df_ms_sex_full %>%
   filter(agecut5_numeric <= 80)
+
+ms_df_full <- read.csv("data/ms.csv") %>%
+  filter(Measure == "Incidence") %>%
+  filter(!Age5 %in% c(0)) %>%
+  mutate(Age5_log = log(Age5),
+         Age5_log_scaled = Age5_log - min(Age5_log),
+         Value_log = log(Value))
   
 ```
+
+## Common constants/code
+
+```{r common, message=FALSE}
+
+# Colours for modeled/unmodeled data points
+colours_modelled <- c("#000000", "#AAAAAA")
+
+# Colours for male/female
+colours_mf <- c("#009E73", "#D55E00")
+
+# Colours for male/female modeled/unmodeled
+colours_mf_modelled <- c("#009E73", "#D55E00", "#AAAAAA", "#AAAAAA")
+
+```
+
 
 ## Model: Linear
 
@@ -75,9 +107,20 @@ fit_linear <- sampling(mod_ms_linear, data = data_list_linear, seed = SEED,
                    control = list(max_treedepth = 15,adapt_delta=0.99),
                    verbose=TRUE)
 
-print(fit_linear)
+#Save version of model presented in submitted manuscript
+#saveRDS(fit_linear,"models/model_linear_1.0.rds")
+
+print(fit_linear,prob=c(0.025,0.5,0.975))
+
+summary(fit_linear)$summary
 
 H_LINEAR = bridge_sampler(fit_linear)
+
+# Comparison with frequentist linear model using median of posterior age-specific
+# values. Not valid as doesn't take into account uncertainty of values which are 
+# important when working with the log-transformed data
+# 
+# summary(lm(middle_log~agecut5_scaled, data=sim_df_ms_model))
 
 ```
 
@@ -106,7 +149,16 @@ fit_bs <- sampling(mod_ms_bs, data = data_list_bs, seed = SEED,
                   control = list(max_treedepth = 15,adapt_delta=0.99),
                   verbose=TRUE)
 
-print(fit_bs)
+#Save version of model presented in submitted manuscript
+#saveRDS(fit_bs,"models/model_bs_1.0.rds")
+
+print(fit_bs,prob=c(0.025,0.5,0.975))
+
+#Age of breakpoint
+values_bs = summary(fit_bs)$summary
+bp=values_bs[3,1]
+
+age_bp = exp(bp + log(min(sim_df_ms_model$agecut5_numeric)))
 
 ## Run in console
 #pdf("plots/bs_pairs_diagnosis.pdf")
@@ -115,13 +167,14 @@ print(fit_bs)
 
 H_BS = bridge_sampler(fit_bs)
 
-bf_bs = bf(H_BS,H_LINEAR)
+# Support for varying slope
+bridgesampling::bf(H_BS,H_LINEAR)
 
 ```
 
 ## Model: Sex Broken-stick
 
-```{r model_broken_stick, message=FALSE}
+```{r model_broken_stick_sex, message=FALSE}
 
 # Common slope and intercept by sex
 mod_ms_bs_sex_common <- stan_model('stan/multistep_brokenstick.stan')
@@ -129,11 +182,12 @@ pars_bs_sex_common <- c('m_early','m_late','bp','c','sigma_sq')
 
 # Allow intercept vary by sex
 mod_ms_bs_sex_vc <- stan_model('stan/multistep_brokenstick_sex_intercept.stan')
-pars_bs_sex_vmc <- c('m_early','m_late','bp','c','c_sex','m_sex','sigma_sq')
+pars_bs_sex_vc <- c('m_early','m_late','bp','c','c_sex','sigma_sq','c_female')
 
 # Allow slope and intercept to vary by sex
 mod_ms_bs_sex_vmc <- stan_model('stan/multistep_brokenstick_sex.stan')
-pars_bs_sex_vc <- c('m_early','m_late','bp','c','c_sex','sigma_sq')
+pars_bs_sex_vmc <- c('m_early','m_late','bp','c','c_sex','m_sex','sigma_sq',
+                    'c_female','m_early_female','m_late_female')
 
 # data and priors - varying intercept/slope
 data_list_bs_sex <- list(m_early_prior_mean = 5,
@@ -155,7 +209,10 @@ fit_bs_sex_common <- sampling(mod_ms_bs_sex_common, data = data_list_bs_sex,
                   control = list(max_treedepth = 20,adapt_delta=0.99),
                   verbose=TRUE)
 
-print(fit_bs_sex_common)
+#Save version of model presented in submitted manuscript
+#saveRDS(fit_bs_sex_common,"models/model_bs_sex_common_1.0.rds")
+
+print(fit_bs_sex_common,prob=c(0.025,0.5,0.975))
 
 # Allow intercept to vary by sex
 fit_bs_sex_vc <- sampling(mod_ms_bs_sex_vc, data = data_list_bs_sex, 
@@ -164,7 +221,13 @@ fit_bs_sex_vc <- sampling(mod_ms_bs_sex_vc, data = data_list_bs_sex,
                   control = list(max_treedepth = 20,adapt_delta=0.99),
                   verbose=TRUE)
 
-print(fit_bs_sex_vc)
+#Save version of model presented in submitted manuscript
+#saveRDS(fit_bs_sex_vc,"models/model_bs_sex_vc_1.0.rds")
+
+print(fit_bs_sex_vc,prob=c(0.025,0.5,0.975))
+
+
+
 
 # Allow slope and intercept to vary by sex
 fit_bs_sex_vmc <- sampling(mod_ms_bs_sex_vmc, data = data_list_bs_sex, 
@@ -173,7 +236,10 @@ fit_bs_sex_vmc <- sampling(mod_ms_bs_sex_vmc, data = data_list_bs_sex,
                   control = list(max_treedepth = 20,adapt_delta=0.99),
                   verbose=TRUE)
 
-print(fit_bs_sex_vmc)
+#Save version of model presented in submitted manuscript
+#saveRDS(fit_bs_sex_vmc,"models/model_bs_sex_vmc_1.0.rds")
+
+print(fit_bs_sex_vmc,prob=c(0.025,0.5,0.975))
 
 ## DIAGNOSITICS
 ## Run in console
@@ -185,8 +251,336 @@ H_BS_SEX_COMMON = bridge_sampler(fit_bs_sex_common)
 H_BS_SEX_VC = bridge_sampler(fit_bs_sex_vc)
 H_BS_SEX_VMC = bridge_sampler(fit_bs_sex_vmc)
 
-bf(H_BS_SEX_VC,H_BS_SEX_COMMON)
-bf(H_BS_SEX_VMC,H_BS_SEX_VC)
+# Support for varying intercept
+bridgesampling::bf(H_BS_SEX_VC,H_BS_SEX_COMMON)
+
+# Support for varying slope
+bridgesampling::bf(H_BS_SEX_VMC,H_BS_SEX_VC)
+
+```
+
+## Model: Armitage-Doll
+
+```{r model_ad, message=FALSE, echo=FALSE}
+
+# Lets try with nls to get an idea of parameter values to start with
+
+nlm <- nls(middle ~ (alpha*agecut5_numeric)^(k-1)*100000, data=sim_df_ms_model,start=list(alpha=0.005, k=6))
+
+summary(nlm)
+
+mod_ms_ad <- stan_model('stan/multistep_ad.stan')
+
+pars_ad <- c('alpha','k','sigma_sq')
+
+data_list_ad <- list(
+                  alpha_prior_mean = 5,
+                  alpha_prior_sd = 10,
+                  k_prior_mean = 7,
+                  k_prior_sd = 2,
+                  N=nrow(sim_df_ms_model),
+                  x = sim_df_ms_model$agecut5_numeric,
+                  y = sim_df_ms_model$middle,
+                  y_min = sim_df_ms_model$lower,
+                  y_max = sim_df_ms_model$upper)
+
+fit_ad <- sampling(mod_ms_ad, data = data_list_ad, seed = SEED,
+                   pars = pars_ad, chains = 4, iter = 2000,
+                   control = list(max_treedepth = 15,adapt_delta=0.99),
+                   verbose=TRUE)
+
+
+
+print(fit_ad)
+pairs(fit_ad)
+
+
+
+H_AD = bridge_sampler(fit_ad)
+
+```
+
+## Model: Armitage-Doll Sex
+
+```{r model_ad_sex, message=FALSE, echo=FALSE}
+
+mod_ms_ad_sex <- stan_model('stan/multistep_ad_sex.stan')
+
+pars_ad_sex <- c('alpha','k','alpha_sex','k_sex','sigma_sq','alpha_female','k_female')
+
+data_list_ad_sex <- list(
+                  alpha_prior_mean = 5,
+                  alpha_prior_sd = 10,
+                  k_prior_mean = 7,
+                  k_prior_sd = 2,
+                  N=nrow(sim_df_ms_sex_model),
+                  DEBUG=0,
+                  x = sim_df_ms_sex_model$agecut5_numeric,
+                  y = sim_df_ms_sex_model$middle,
+                  sex = abs(as.numeric(factor(sim_df_ms_sex_model$sex))-1),
+                  y_min = sim_df_ms_sex_model$lower,
+                  y_max = sim_df_ms_sex_model$upper)
+
+init_ms_ad_sex <- function() {
+  list(alpha = 5, k = 8, alpha_sex=0, k_sex=0, sigma_sq = 80)
+}
+
+fit_ad_sex <- sampling(mod_ms_ad_sex, data = data_list_ad_sex, seed = SEED,
+                       init = init_ms_ad_sex,
+                   pars = pars_ad_sex, chains = 4, iter = 2000,
+                   control = list(max_treedepth = 15,adapt_delta=0.99),
+                   verbose=TRUE)
+
+#Save version of model presented in submitted manuscript
+#saveRDS(fit_ad_sex,"models/model_ad_sex_1.0.rds")
+
+print(fit_ad_sex,prob=c(0.025,0.5,0.975))
+pairs(fit_ad_sex)
+
+
+
+H_AD_SEX = bridge_sampler(fit_ad_sex)
+
+```
+
+
+## Model: Beta
+
+```{r model_beta, message=FALSE}
+
+# Lets try with nls to get an idea of parameter values to start with
+
+nlm <- nls(middle ~ (alpha*agecut5_numeric)^(k-1)*(1-beta*agecut5_numeric)*100000, data=sim_df_ms_full,start=list(alpha=0.005, beta=0.01, k=5))
+
+summary(nlm)
+
+mod_ms_beta <- stan_model('stan/multistep_beta.stan')
+
+pars_beta <- c('alpha','beta','k','sigma_sq')
+
+data_list_beta <- list(
+                  alpha_prior_mean = 0,
+                  alpha_prior_sd = 0.01,
+                  beta_prior_mean = 0,
+                  beta_prior_sd = 0.01,
+                  k_prior_mean = 7,
+                  k_prior_sd = 2,
+                  N=nrow(sim_df_ms_full),
+                  x = sim_df_ms_full$agecut5_numeric,
+                  y = sim_df_ms_full$middle,
+                  y_min = sim_df_ms_full$lower,
+                  y_max = sim_df_ms_full$upper)
+
+initf1 <- function() {
+  list(alpha = 0.006, beta = 0.01, k = 7, sigma_sq = 80)
+}
+
+fit_beta <- sampling(mod_ms_beta, data = data_list_beta, seed = SEED,
+                   pars = pars_beta, chains = 4, iter = 2000, init=initf1,
+                   control = list(max_treedepth = 15,adapt_delta=0.99),
+                   verbose=TRUE)
+
+print(fit_beta)
+pairs(fit_beta)
+
+H_BETA = bridge_sampler(fit_beta)
+
+```
+## Model: Beta Sex
+
+```{r model_beta_sex, message=FALSE, echo=FALSE}
+
+mod_ms_beta_sex <- stan_model('stan/multistep_beta_sex.stan')
+
+pars_beta_sex <- c('alpha','beta','k',
+                   'alpha_sex','beta_sex','k_sex',
+                   'alpha_female','beta_female','k_female',
+                   'sigma_sq')
+
+data_list_beta_sex <- list(
+                  alpha_prior_mean = 5,
+                  alpha_prior_sd = 10,
+                  beta_prior_mean = 0,
+                  beta_prior_sd = 1,
+                  k_prior_mean = 7,
+                  k_prior_sd = 2,
+                  N=nrow(sim_df_ms_sex_model),
+                  DEBUG=0,
+                  x = sim_df_ms_sex_model$agecut5_numeric,
+                  y = sim_df_ms_sex_model$middle,
+                  sex = abs(as.numeric(factor(sim_df_ms_sex_model$sex))-1),
+                  y_min = sim_df_ms_sex_model$lower,
+                  y_max = sim_df_ms_sex_model$upper)
+
+init_ms_beta_sex <- function() {
+  list(alpha = 5, k = 8, alpha_sex=0, k_sex=0, sigma_sq = 80)
+}
+
+fit_beta_sex <- sampling(mod_ms_beta_sex, data = data_list_beta_sex, seed = SEED,
+                       init = init_ms_beta_sex,
+                   pars = pars_beta_sex, chains = 4, iter = 2000,
+                   control = list(max_treedepth = 15,adapt_delta=0.99),
+                   verbose=TRUE)
+
+#Save version of model presented in submitted manuscript
+#saveRDS(fit_beta_sex,"models/model_beta_sex_1.0.rds")
+
+print(fit_beta_sex,prob=c(0.025,0.5,0.975))
+
+pairs(fit_beta_sex)
+
+
+
+H_BETA_SEX = bridge_sampler(fit_beta_sex)
+
+```
+
+
+## Model: Susceptibility
+
+
+```{r model_susceptibility, message=FALSE}
+
+# Lets try with nls to get an idea of parameter values to start with
+
+nlm <- nls(middle ~ alpha*agecut5_numeric^(k-1)*100000/(1+((1-C)/C)*exp(alpha/k*(agecut5_numeric^k-1))), data=sim_df_ms_full,start=list(alpha=1e-13, C=0.05, k=7))
+
+summary(nlm)
+
+mod_ms_suscept <- stan_model('stan/multistep_susceptibility.stan')
+
+pars_suscept <- c('alpha','C','k','sigma_sq')
+
+data_list_suscept <- list(C_prior_mean = 5,
+                  C_prior_sd = 5,
+                  alpha_prior_mean = 0,
+                  alpha_prior_sd = 10,
+                  k_prior_mean = 7,
+                  k_prior_sd = 2,
+                  N=nrow(sim_df_ms_full),
+                  x = sim_df_ms_full$agecut5_numeric,
+                  y = sim_df_ms_full$middle,
+                  y_min = sim_df_ms_full$lower,
+                  y_max = sim_df_ms_full$upper)
+
+init_suscept <- function() {
+  list(alpha = 1, C = 5, k = 7, sigma_sq = 80)
+}
+
+
+fit_suscept <- sampling(mod_ms_suscept, data = data_list_suscept, seed = SEED,
+                   pars = pars_suscept, chains = 4, iter = 2000, 
+                   init = init_suscept,
+                   control = list(max_treedepth = 15,adapt_delta=0.99),
+                   verbose=TRUE)
+
+print(fit_suscept)
+summary(fit_suscept)
+pairs(fit_suscept,pars=pars_suscept)
+
+H_SUSCEPT = bridge_sampler(fit_suscept)
+
+bridgesampling::bf(H_SUSCEPT,H_AD)
+bridgesampling::bf(H_BETA,H_AD)
+bridgesampling::bf(H_SUSCEPT,H_BETA)
+
+```
+## Model: Susceptibility fixed C
+
+
+```{r model_susceptibility_fixed_c, message=FALSE}
+
+# Iterate over values of C, to see how plausible alterative values of C are
+
+mod_ms_suscept_fixed <- stan_model('stan/multistep_susceptibility_fixed_C.stan')
+
+pars_suscept_fixed <- c('alpha','k','sigma_sq')
+
+data_list_suscept_fixed <- list(C = 3,
+                  alpha_prior_mean = 0,
+                  alpha_prior_sd = 10,
+                  k_prior_mean = 7,
+                  k_prior_sd = 2,
+                  N=nrow(sim_df_ms_full),
+                  x = sim_df_ms_full$agecut5_numeric,
+                  y = sim_df_ms_full$middle,
+                  y_min = sim_df_ms_full$lower,
+                  y_max = sim_df_ms_full$upper)
+
+init_suscept_fixed <- function() {
+  list(alpha = 1, k = 7, sigma_sq = 80)
+}
+
+fit_suscept_fixed <- sampling(mod_ms_suscept_fixed, 
+                              data = data_list_suscept_fixed, 
+                              seed = SEED,
+                              pars = pars_suscept_fixed, 
+                              chains = 4, iter = 2000, 
+                              init = init_suscept_fixed,
+                              control = list(max_treedepth = 15,
+                                             adapt_delta=0.99),
+                              verbose=TRUE)
+
+H_SUSCEPT_FIXED = bridge_sampler(fit_suscept_fixed)
+
+bridgesampling::bf(H_SUSCEPT_FIXED,H_AD)
+
+
+```
+
+
+## Model: Susceptibility Sex
+
+
+```{r model_susceptibility_sex, message=FALSE}
+
+mod_ms_suscept_sex <- stan_model('stan/multistep_susceptibility_sex.stan')
+
+pars_suscept_sex <- c('alpha','C','k',
+                      'alpha_sex','C_sex','k_sex',
+                      'alpha_female','C_female','k_female','sigma_sq')
+
+data_list_suscept_sex <- list(C_prior_mean = 5,
+                  C_prior_sd = 5,
+                  alpha_prior_mean = 0,
+                  alpha_prior_sd = 10,
+                  k_prior_mean = 7,
+                  k_prior_sd = 2,
+                  N=nrow(sim_df_ms_sex_full),
+                  DEBUG=0,
+                  x = sim_df_ms_sex_full$agecut5_numeric,
+                  y = sim_df_ms_sex_full$middle,
+                  sex = abs(as.numeric(factor(sim_df_ms_sex_full$sex))-1),
+                  y_min = sim_df_ms_sex_full$lower,
+                  y_max = sim_df_ms_sex_full$upper)
+
+init_ms_suspect_sex <- function() {
+  list(alpha = 2, C = 8, k = 8, alpha_sex=0, C_sex=0, k_sex=0, sigma_sq = 80)
+}
+
+fit_suscept_sex <- sampling(mod_ms_suscept_sex, data = data_list_suscept_sex, 
+                            seed = SEED, init = init_ms_suspect_sex,
+                   pars = pars_suscept_sex, chains = 4, iter = 2000,
+                   control = list(max_treedepth = 15,adapt_delta=0.99),
+                   verbose=TRUE)
+
+#Save version of model presented in submitted manuscript
+#saveRDS(fit_suscept_sex,"models/model_suscept_sex_1.0.rds")
+
+print(fit_suscept_sex,prob=c(0.025,0.5,0.975))
+
+pairs(fit_suscept_sex,pars=c("C","k","alpha","C_sex","k_sex","alpha_sex"))
+
+## Run in console
+pdf("plots/suscept_sex_pairs_diagnosis.pdf")
+pairs(fit_suscept_sex,pars=c("C","k","alpha","C_sex","k_sex","alpha_sex"))
+dev.off()
+
+#H_SUSCEPT = bridge_sampler(fit_suscept)
+
+#bridgesampling::bf(H_SUSCEPT,H_AD)
+#bridgesampling::bf(H_BETA,H_AD)
+#bridgesampling::bf(H_SUSCEPT,H_BETA)
 
 ```
 
@@ -208,7 +602,9 @@ fig2_age_specific_incidence <- sim_df_ms_full %>%
   ylab("Incidence\n(per 100 000 per year)")+
   scale_shape_manual(values=c(21))+
   xlab("Age")+ theme(legend.position = "none")+
-  annotate("text",x=1,y=300,label="A")
+  annotate("text",x=1,y=300,label="A")+
+  theme_minimal()
+  #annotate("text",x=6,y=300,label="Parkinson's disease")
 
 plot(fig2_age_specific_incidence)
 ggsave("plots/multistep-incidence-by-age.pdf",width=5,height=3)
@@ -220,9 +616,8 @@ ggsave("plots/multistep-incidence-by-age.png",width=5,height=3)
 ```{r age-sex-specific-incidence-figure, fig.width = 18/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
 
 fig2_age_sex_specific_incidence <- sim_df_ms_sex_full %>%
-  ggplot(aes(x=agecut5,y=middle,group="incidence"))+
-  geom_ribbon(aes(ymin=lower,ymax=upper),alpha=0.3)+
-  facet_wrap(~sex)+
+  ggplot(aes(x=agecut5,y=middle,colour=sex,group=sex,shape=sex))+
+  geom_errorbar(aes(ymin=lower,ymax=upper), width=0)+
   scale_x_discrete("Age", labels = c("30","",
                                      "40","","50","",
                                      "60","","70","",
@@ -231,9 +626,13 @@ fig2_age_sex_specific_incidence <- sim_df_ms_sex_full %>%
   ))+
   geom_line(size=0.2)+geom_point(size=2,fill="grey")+
   ylab("Incidence\n(per 100 000 per year)")+
-  scale_shape_manual(values=c(21))+
-  xlab("Age")+ theme(legend.position = "none")+
-  annotate("text",x=1,y=300,label="A")
+  #scale_shape_manual(values=c(21))+
+  scale_color_manual(values = colours_mf)+
+  xlab("Age")  +
+  annotate("text",x=1,y=450,label="A")+
+  theme_minimal() + 
+  theme(legend.position = c(0.3,0.7),
+                         legend.title = element_blank())
 
 plot(fig2_age_sex_specific_incidence)
 ggsave("plots/multistep-incidence-by-sex-age.pdf",width=5,height=3)
@@ -252,15 +651,22 @@ end = max(sim_df_ms_model$agecut5_scaled)
 m = values_l[1,1]
 c = values_l[2,1]
 
+
+
 fig2_log_linear <- sim_df_ms_full %>%
-  ggplot(aes(x=agecut5_scaled,y=middle_log,group=type))+
+  ggplot(aes(x=agecut5_scaled,y=middle_log,
+             group=type,colour=restriction))+
   geom_errorbar(aes(ymin=lower_log,ymax=upper_log), width=0)+
-  ylab("Log Incidence\n(per 100 000 per year)")+
-  xlab("log(Age) - log(30)")+ theme(legend.position = "none")+
+  ylab("Log Incidence\n(per 100 000 per year)") +
+  xlab("log(Age) - log(30)") + 
   geom_segment(x=start,y=c+m*start,
                xend=end,yend=c+m*end,colour="#CC79A7")+
-  geom_point(size=2,fill="grey")+
-  annotate("text",x=0,y=5,label="B")
+  geom_point(size=2) +
+  scale_colour_manual(values = colours_modelled)+
+  annotate("text",x=0,y=5,label="B")+
+  theme_minimal()+
+  theme(legend.position = "none")
+  #annotate("text",x=0.43,y=5,label="Parkinson's disease")
 
 plot(fig2_log_linear)
 ggsave("plots/multistep-log-relationship.pdf",width=6,height=4)
@@ -289,6 +695,67 @@ y1 = c+m_early*x1
 x2 = bp
 y2 = c+m_early*x2
 
+#x2a = bp+offset
+#y2a = c+m_early*x2a
+
+x2a = end
+y2a = c+m_early*x2a
+
+#x2b = bp-offset
+#y2b = y2-m_late*offset
+
+x2b = start
+y2b = y2-m_late*(bp-start)
+
+x3 = end
+y3 = y2+(end-bp)*m_late
+
+fig2_log_broken_stick <- sim_df_ms_full %>%
+  ggplot(aes(x=agecut5_scaled,y=middle_log,
+             group=type,colour=restriction))+
+  geom_errorbar(aes(ymin=lower_log,ymax=upper_log), width=0)+
+  ylab("Log Incidence\n(per 100 000 per year)")+
+  xlab("log(Age) - log(30)")+ theme(legend.position = "none")+
+  geom_segment(x=x1,y=y1,
+               xend=x2,yend=y2,colour="#56B4E9")+
+  geom_segment(x=x2,y=y2,
+               xend=x2a,yend=y2a,colour="#56B4E9",linetype="dashed")+
+  geom_segment(x=x2b,y=y2b,
+               xend=x2,yend=y2,colour="#E69F00",linetype="dashed")+
+  geom_segment(x=x2,y=y2,
+               xend=x3,yend=y3,colour="#E69F00")+
+  geom_point(size=2) +
+  scale_colour_manual(values = colours_modelled)+
+  annotate("text",x=0,y=5,label="C")+
+  theme_minimal()+
+  theme(legend.position = "none")
+  #annotate("text",x=0.43,y=5,label="Parkinson's disease")
+
+plot(fig2_log_broken_stick)
+ggsave("plots/multistep-log-relationship-bs.pdf",width=6,height=4)
+ggsave("plots/multistep-log-relationship-bs.png",width=6,height=4)
+
+```
+## Plot-HRC: Broken-stick model
+
+```{r hrc-broken-stick-figure, fig.width = 18/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+# Extract fitted values from model
+values_bs = summary(fit_bs)$summary
+
+m_early=values_bs[1,1]
+m_late=values_bs[2,1]
+bp=values_bs[3,1]
+c=values_bs[4,1]
+
+offset = 0.25
+
+x1 = start
+y1 = c+m_early*x1
+
+x2 = bp
+y2 = c+m_early*x2
+
 x2a = bp+offset
 y2a = c+m_early*x2a
 
@@ -298,11 +765,23 @@ y2b = y2-m_late*offset
 x3 = end
 y3 = y2+(end-bp)*m_late
 
-fig2_log_broken_stick <- sim_df_ms_full %>%
-  ggplot(aes(x=agecut5_scaled,y=middle_log,group=type))+
+x_axis <- data.frame(age_label=seq(30,100,by=10)) %>%
+  mutate(age_x = log(age_label)-log(30))
+
+y_axis <- data.frame(inc_label=c(1,10,100,1000)) %>%
+  mutate(inc_y=log(inc_label))  
+
+fig2_log_broken_stick_HRC <- sim_df_ms_full %>%
+  ggplot(aes(x=agecut5_scaled,y=middle_log,
+             group=type,colour=restriction))+
   geom_errorbar(aes(ymin=lower_log,ymax=upper_log), width=0)+
-  ylab("Log Incidence\n(per 100 000 per year)")+
-  xlab("log(Age) - log(30)")+ theme(legend.position = "none")+
+  scale_x_continuous(breaks = x_axis$age_x, 
+                     labels = x_axis$age_label,
+                     name = "Age")+
+  scale_y_continuous(breaks = y_axis$inc_y, 
+                     labels = y_axis$inc_label,
+                     limits = c(-1,7),
+                     name = "Incidence (per 100 000 per year)")+
   geom_segment(x=x1,y=y1,
                xend=x2,yend=y2,colour="#56B4E9")+
   geom_segment(x=x2,y=y2,
@@ -311,17 +790,18 @@ fig2_log_broken_stick <- sim_df_ms_full %>%
                xend=x2,yend=y2,colour="#E69F00",linetype="dotted")+
   geom_segment(x=x2,y=y2,
                xend=x3,yend=y3,colour="#E69F00")+
-  geom_point(size=2,fill="grey")+
-  annotate("text",x=0,y=5,label="C")
+  geom_point(size=2) +
+  scale_colour_manual(values = colours_modelled)+
+  theme_minimal()+
+  theme(legend.position = "none")
 
-plot(fig2_log_broken_stick)
-ggsave("plots/multistep-log-relationship-bs.pdf",width=6,height=4)
-ggsave("plots/multistep-log-relationship-bs.png",width=6,height=4)
+plot(fig2_log_broken_stick_HRC)
+ggsave("plots/multistep-log-relationship-bs-HRC.pdf",width=6,height=4)
+ggsave("plots/multistep-log-relationship-bs-HRC.png",width=6,height=4)
 
 ```
 
-
-## Plot:  mean age-specific by sex
+## Plot:  Broken-stick model by sex
 
 ```{r broken-stick-sex-figure, fig.width = 18/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
 
@@ -334,27 +814,31 @@ bp=values_bs[3,1]
 c=values_bs[4,1]
 c_sex=values_bs[5,1]
 
-colours_mf <- c("#009E73", "#D55E00")
 
 fig2_log_sex <- sim_df_ms_sex_full %>%
-  mutate(sex = factor(sex,levels=c("Male","Female"))) %>%
   filter(agecut5_numeric >= 30) %>%
-  ggplot(aes(x=agecut5_scaled,y=middle_log,group=sex,shape=sex,colour=sex))+
+  ggplot(aes(x=agecut5_scaled,y=middle_log,group=sex,
+             shape=sex,colour=sex_restriction))+
   geom_errorbar(aes(ymin=lower_log,ymax=upper_log), width=0)+
   ylab("Log Incidence\n(per 100 000 per year)")+
-  xlab("log(Age) - log(30)")+ theme(legend.position = c(0.8,0.2),
-                         legend.title = element_blank())+
-  scale_color_manual(values = colours_mf)+
+  xlab("log(Age) - log(30)") + 
+  #theme(legend.position = c(0.8,0.2),
+  #                       legend.title = element_blank()) +
+  scale_color_manual(values = colours_mf_modelled)+
   geom_segment(x=start,y=c+m_early*start,
-               xend=bp,yend=c+m_early*bp,colour=colours_mf[1])+
+               xend=bp,yend=c+m_early*bp,colour=colours_mf[2])+
   geom_segment(x=bp,y=c+m_early*bp,
-               xend=end,yend=c+m_early*bp+(end-bp)*m_late,colour=colours_mf[1])+
+               xend=end,yend=c+m_early*bp+(end-bp)*m_late,colour=colours_mf[2])+
   geom_segment(x=start,y=c+c_sex+m_early*start,
-               xend=bp,yend=c+c_sex+m_early*bp,colour=colours_mf[2])+
+               xend=bp,yend=c+c_sex+m_early*bp,colour=colours_mf[1])+
   geom_segment(x=bp,y=c+c_sex+m_early*bp,
-               xend=end,yend=c+c_sex+m_early*bp+(end-bp)*m_late,colour=colours_mf[2])+
-  geom_point(size=2)+
-  annotate("text",x=0,y=5,label="D")
+               xend=end,yend=c+c_sex+m_early*bp+
+                  (end-bp)*m_late,colour=colours_mf[1])+
+  guides(colour=FALSE) +
+  geom_point(size=2) +
+  annotate("text",x=0,y=5,label="B")+
+  theme_minimal()+
+  theme(legend.position = "none")
 
 
 print(fig2_log_sex)
@@ -363,21 +847,440 @@ ggsave("plots/multistep-log-relationship-sex.pdf",width=6,height=4)
 ggsave("plots/multistep-log-relationship-sex.png",width=6,height=4)
 ```
 
-## Plot: Figure 2
+## Plot-HRC:  broken-stick model by sex
 
-```{r figure2, fig.width = 8/2.54, fig.height = 20/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+```{r hrc-broken-stick-sex-figure, fig.width = 18/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
 
-figure_2 = cowplot::plot_grid(fig2_age_specific_incidence,
-                              fig2_log_linear,
-                              fig2_log_broken_stick, 
-                              fig2_log_sex, 
-                              align = 'v',
-                              axis = 'bt', ncol = 1)
+# Extract fitted values from model
+values_bs = summary(fit_bs_sex_vc)$summary
 
-plot(figure_2)
-ggsave("plots/multistep-figure-2.pdf",width=4,height=10)
-ggsave("plots/multistep-figure-2.png",width=4,height=10)
+m_early=values_bs[1,1]
+m_late=values_bs[2,1]
+bp=values_bs[3,1]
+c=values_bs[4,1]
+c_sex=values_bs[5,1]
+
+x_axis <- data.frame(age_label=seq(30,100,by=10)) %>%
+  mutate(age_x = log(age_label)-log(30))
+
+y_axis <- data.frame(inc_label=c(1,10,100,1000)) %>%
+  mutate(inc_y=log(inc_label))  
+
+fig2_log_sex_HRC <- sim_df_ms_sex_full %>%
+  mutate(sex = factor(sex,levels=c("Male","Female"))) %>%
+  filter(agecut5_numeric >= 30) %>%
+  ggplot(aes(x=agecut5_scaled,y=middle_log,group=sex,
+             shape=sex,colour=sex_restriction))+
+  geom_errorbar(aes(ymin=lower_log,ymax=upper_log), width=0)+
+  scale_x_continuous(breaks = x_axis$age_x, 
+                     labels = x_axis$age_label,
+                     name = "Age")+
+  scale_y_continuous(breaks = y_axis$inc_y, 
+                     labels = y_axis$inc_label,
+                     limits = c(-1,7),
+                     name = "Incidence (per 100 000 per year)")+
+  guides(colour=FALSE) +
+  scale_color_manual(values = colours_mf_modelled)+
+  geom_segment(x=start,y=c+m_early*start,
+               xend=bp,yend=c+m_early*bp,colour=colours_mf[2])+
+  geom_segment(x=bp,y=c+m_early*bp,
+               xend=end,yend=c+m_early*bp+(end-bp)*m_late,colour=colours_mf[2])+
+  geom_segment(x=start,y=c+c_sex+m_early*start,
+               xend=bp,yend=c+c_sex+m_early*bp,colour=colours_mf[1])+
+  geom_segment(x=bp,y=c+c_sex+m_early*bp,
+               xend=end,yend=c+c_sex+m_early*bp+(end-bp)*m_late,colour=colours_mf[1])+
+  geom_point(size=2)+
+  theme_minimal()+
+    theme(legend.position = c(0.8,0.2),
+                         legend.title = element_blank())
+
+
+print(fig2_log_sex_HRC)
+
+ggsave("plots/multistep-log-relationship-sex-HRC.pdf",width=6,height=4)
+ggsave("plots/multistep-log-relationship-sex-HRC.png",width=6,height=4)
+```
+
+
+
+
+
+
+
+
+
+## Plot: Armitage-Doll model
+
+```{r armitage_doll, fig.width = 10/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+# Extract fitted values from model
+values_ad = summary(fit_ad)$summary
+alpha=values_ad[1,1]/1e3
+k=values_ad[2,1]
+
+simdf <- data.frame(age=seq(30,100)) %>%
+  mutate(predinc = (alpha*age)^(k-1)*100000)
+
+fig4_ad <- ggplot(simdf,aes(x=age,y=predinc))+geom_line(colour="#CC79A7")+
+  geom_point(data=sim_df_ms_full,aes(x=agecut5_numeric,y=middle))+
+  geom_errorbar(data=sim_df_ms_full,aes(x=agecut5_numeric,y=middle,ymin=lower,ymax=upper), width=0)+
+  annotate("text",x=40,y=1000,label="Armitage-Doll\n Model")+
+  xlab("Age")+ylab("Incidence\n(per 100 000 per year)")+
+  theme_minimal()
+
+plot(fig4_ad)
+ggsave("plots/multistep-ad-fit.pdf",width=5,height=3)
+
+```
+
+## Plot: Armitage-Doll model by Sex
+
+```{r armitage_doll_sex, fig.width = 10/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+
+# Extract fitted values from model
+values_ad_sex = summary(fit_ad_sex)$summary
+
+alpha=values_ad_sex[1,1]/1e3
+k=values_ad_sex[2,1]
+
+alpha_sex=values_ad_sex[3,1]/1e3
+k_sex=values_ad_sex[4,1]
+
+alpha1 <- alpha + alpha_sex
+k1 <- k + k_sex
+
+simdf <- data.frame(age=seq(30,100)) %>%
+  mutate(predinc = (alpha*age)^(k-1)*100000)
+
+simdf_female <- data.frame(age=seq(30,100)) %>%
+  mutate(predinc = (alpha1*age)^(k1-1)*100000)
+
+
+
+fig4_ad_sex <- sim_df_ms_sex_full %>%
+  mutate(sex = factor(sex,levels=c("Male","Female"))) %>%
+  ggplot(aes(x=agecut5_numeric,y=middle,colour=sex,shape=sex))+
+  geom_point()+geom_errorbar(aes(ymin=lower,ymax=upper), width=0)+
+  scale_color_manual(values = colours_mf)+
+  geom_line(data=simdf,aes(x=age,y=predinc,shape=NULL),colour=colours_mf[1])+
+  geom_line(data=simdf_female,aes(x=age,y=predinc,shape=NULL),colour=colours_mf[2])+
+  annotate("text",x=40,y=600,label="Armitage-Doll\nModel")+
+  xlab("Age")+ylab("Incidence\n(per 100 000 per year)")+
+  coord_cartesian(ylim=c(0, 700))+
+  theme_minimal()+ylim(0,600)+
+  theme(legend.position = c(0.2,0.4),
+        legend.title = element_blank())
+
+plot(fig4_ad_sex)
+ggsave("plots/multistep-ad-sex.pdf",width=5,height=3)
+ggsave("plots/multistep-ad-sex.png",width=5,height=3)
 
 ```
 
 
+## Plot: Beta model
+
+```{r beta, fig.width = 10/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+# Fit for beta (from nls)
+alpha = 6.084e-03
+beta = 9.863e-03
+k = 7.202
+
+# Extract fitted values from model
+values_beta = summary(fit_beta)$summary
+
+alpha=values_beta[1,1]
+beta=values_beta[2,1]
+k=values_beta[3,1]
+
+#values_beta = summary(fit_beta)$c_summary
+#chain = 2
+
+#alpha=values_beta[1,1,chain]
+#beta=values_beta[2,1,chain]
+#k=values_beta[3,1,chain]
+
+
+simdf <- data.frame(age=seq(30,100)) %>%
+  mutate(predinc = (alpha*age)^(k-1)*(1-beta*age)*100000)
+
+fig4_beta <- ggplot(simdf,aes(x=age,y=predinc))+geom_line(colour="#CC79A7")+
+  geom_point(data=sim_df_ms_full,aes(x=agecut5_numeric,y=middle))+
+  geom_errorbar(data=sim_df_ms_full,aes(x=agecut5_numeric,y=middle,ymin=lower,ymax=upper), width=0)+
+  annotate("text",x=40,y=250,label="Beta\n Model")+
+  xlab("Age")+ylab("Incidence\n(per 100 000 per year)")+
+  theme_minimal()
+
+plot(fig4_beta)
+ggsave("plots/multistep-beta-fit.pdf",width=5,height=3)
+
+```
+
+## Plot: Beta model by Sex
+
+```{r beta_sex, fig.width = 10/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+
+# Extract fitted values from model
+values_beta_sex = summary(fit_beta_sex)$summary
+
+alpha=values_beta_sex[1,1]/1e3
+beta=values_beta_sex[2,1]/1e2
+k=values_beta_sex[3,1]
+
+alpha_sex=values_beta_sex[4,1]/1e3
+beta_sex=values_beta_sex[5,1]/1e2
+k_sex=values_beta_sex[6,1]
+
+alpha1 <- alpha + alpha_sex
+k1 <- k + k_sex
+beta1 <- beta + beta_sex
+
+simdf <- data.frame(age=seq(30,100)) %>%
+  mutate(predinc = (alpha*age)^(k-1)*(1-beta*age)*100000)
+
+simdf_female <- data.frame(age=seq(30,100)) %>%
+  mutate(predinc = (alpha1*age)^(k1-1)*(1-beta1*age)*100000)
+
+fig4_beta_sex <- sim_df_ms_sex_full %>%
+  mutate(sex = factor(sex,levels=c("Male","Female"))) %>%
+  ggplot(aes(x=agecut5_numeric,y=middle,colour=sex,shape=sex))+
+  geom_point()+geom_errorbar(aes(ymin=lower,ymax=upper), width=0)+
+  scale_color_manual(values = colours_mf)+
+  geom_line(data=simdf,aes(x=age,y=predinc,shape=NULL),colour=colours_mf[1])+
+  geom_line(data=simdf_female,aes(x=age,y=predinc,shape=NULL),colour=colours_mf[2])+
+  annotate("text",x=40,y=600,label="Beta Model")+
+  xlab("Age")+ylab("Incidence\n(per 100 000 per year)")+
+  coord_cartesian(ylim=c(0, 700))+
+  theme_minimal()+
+  theme(legend.position = "none")
+
+plot(fig4_beta_sex)
+ggsave("plots/multistep-beta-sex.pdf",width=5,height=3)
+ggsave("plots/multistep-beta-sex.png",width=5,height=3)
+
+```
+
+## Plot: Susceptibility
+
+```{r susceptibility, fig.width = 10/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+# nls
+#alpha = 1.2e-15
+#C = 8.024e-02
+#k = 8.2
+
+# stan
+alpha = 2.03e-15
+C = 8.06e-02
+k = 8.11
+
+# Extract fitted values from model
+values_suscept = summary(fit_suscept)$summary
+
+alpha=values_suscept[1,1]/1e15
+C=values_suscept[2,1]/100
+k=values_suscept[3,1]
+
+simdf <- data.frame(age=seq(30,100)) %>%
+  mutate(predinc = alpha*age^(k-1)*100000/(1+((1-C)/C)*exp(alpha/k*(age^k-1))))
+
+fig4_susceptibility <- ggplot(simdf,aes(x=age,y=predinc))+geom_line(colour="#CC79A7")+
+  geom_point(data=sim_df_ms_full,aes(x=agecut5_numeric,y=middle))+
+  geom_errorbar(data=sim_df_ms_full,aes(x=agecut5_numeric,y=middle,ymin=lower,ymax=upper), width=0)+
+  annotate("text",x=40,y=250,label="Susceptibility\n Model")+
+  xlab("Age")+ylab("Incidence\n(per 100 000 per year)")+
+  theme_minimal()
+
+plot(fig4_susceptibility)
+ggsave("plots/multistep-susceptibiliy.pdf",width=5,height=3)
+
+```
+
+## Plot: Susceptibility Fixed
+
+```{r susceptibility_fixed_C, fig.width = 10/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+# Extract fitted values from model
+values_suscept = summary(fit_suscept_fixed)$summary
+
+alpha=values_suscept[1,1]/1e15
+k=values_suscept[2,1]
+C=data_list_suscept_fixed$C/100
+
+
+simdf <- data.frame(age=seq(30,100)) %>%
+  mutate(predinc = alpha*age^(k-1)*100000/(1+((1-C)/C)*exp(alpha/k*(age^k-1))))
+
+fig4_susceptibility_fixed <- ggplot(simdf,aes(x=age,y=predinc))+geom_line(colour="#CC79A7")+
+  geom_point(data=sim_df_ms_full,aes(x=agecut5_numeric,y=middle))+
+  geom_errorbar(data=sim_df_ms_full,aes(x=agecut5_numeric,y=middle,ymin=lower,ymax=upper), width=0)+
+  annotate("text",x=40,y=250,label="Susceptibility\n Model")+
+  xlab("Age")+ylab("Incidence\n(per 100 000 per year)")+
+  theme_minimal()
+
+plot(fig4_susceptibility_fixed)
+ggsave("plots/multistep-susceptibiliy-fixed-C-03.pdf",width=5,height=3)
+
+```
+
+## Plot: Susceptibility model by Sex
+
+```{r susceptibility_sex, fig.width = 10/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+# nls
+#alpha = 1.2e-15
+#C = 8.024e-02
+#k = 8.2
+
+# stan
+#alpha = 2.03e-15
+#C = 8.06e-02
+#k = 8.11
+
+# Extract fitted values from model
+values_suscept_sex = summary(fit_suscept_sex)$summary
+
+alpha=values_suscept_sex[1,1]/1e15
+C=values_suscept_sex[2,1]/100
+k=values_suscept_sex[3,1]
+
+alpha_sex=values_suscept_sex[4,1]/1e15
+C_sex=values_suscept_sex[5,1]/100
+k_sex=values_suscept_sex[6,1]
+
+alpha1 <- (alpha + alpha_sex)
+C1 <- C + C_sex
+k1 <- k + k_sex
+
+simdf <- data.frame(age=seq(30,100)) %>%
+  mutate(predinc = alpha*age^(k-1)*100000/(1+((1-C)/C)*exp(alpha/k*(age^k-1))))
+
+simdf_female <- data.frame(age=seq(30,100)) %>%
+  mutate(predinc = alpha1*age^(k1-1)*100000/(1+((1-C1)/C1)*exp(alpha1/k1*(age^k1-1))))
+
+
+
+fig4_susceptibility_sex <- sim_df_ms_sex_full %>%
+  mutate(sex = factor(sex,levels=c("Male","Female"))) %>%
+  ggplot(aes(x=agecut5_numeric,y=middle,colour=sex,shape=sex))+
+  geom_point()+geom_errorbar(aes(ymin=lower,ymax=upper), width=0)+
+  scale_color_manual(values = colours_mf)+
+  geom_line(data=simdf,aes(x=age,y=predinc,shape=NULL),colour=colours_mf[1])+
+  geom_line(data=simdf_female,aes(x=age,y=predinc,shape=NULL),colour=colours_mf[2])+
+  annotate("text",x=40,y=600,label="Susceptibility\n Model")+
+  xlab("Age")+ylab("Incidence\n(per 100 000 per year)")+
+  coord_cartesian(ylim=c(0, 700))+
+  theme_minimal()+
+  theme(legend.position = "none")
+
+plot(fig4_susceptibility_sex)
+ggsave("plots/multistep-susceptibiliy-sex.pdf",width=5,height=3)
+ggsave("plots/multistep-susceptibiliy-sex.png",width=5,height=3)
+
+```
+
+
+
+
+
+## Plot: MS Age-specific incidence non-log
+
+```{r ms-age-specific-incidence-figure, fig.width = 18/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+fig_ms_age_specific_incidence <- ms_df_full %>%
+  ggplot(aes(x=factor(Age5),y=Value,group=Measure))+
+  scale_x_discrete("Age", labels = c("20","",
+                                     "30","",
+                                     "40","","50","",
+                                     "60","","70",
+                                     "75+"
+  ))+
+  geom_line(size=0.2)+geom_point(size=2,fill="grey")+
+  ylab("Incidence\n(per 100 000 per year)")+
+  scale_shape_manual(values=c(21))+
+  xlab("Age")+ theme(legend.position = "none")+
+  ylim(0,8)+
+  annotate("text",x=1,y=7.5,label="D")+
+  annotate("text",x=10,y=7.5,label="Multiple sclerosis")+
+  theme_minimal()
+
+plot(fig_ms_age_specific_incidence)
+ggsave("plots/multistep-ms-incidence-by-age.pdf",width=5,height=3)
+ggsave("plots/multistep-ms-incidence-by-age.png",width=5,height=3)
+```
+
+## Plot: MS Log Linear model
+
+```{r ms-linear-figure, fig.width = 18/2.54, fig.height = 7/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+
+fig_ms_log_linear <- ms_df_full %>%
+  filter(Value_log > -1000) %>%
+  ggplot(aes(x=Age5_log_scaled,y=Value_log,
+             group=Measure))+
+  ylab("Log Incidence\n(per 100 000 per year)") +
+  xlab("log(Age) - log(20)") + 
+  theme(legend.position = "none") +
+  geom_point(size=2) +
+  ylim(0,3)+
+  annotate("text",x=0,y=2.5,label="E")+
+  annotate("text",x=1.03,y=2.5,label="Multiple sclerosis")+
+  theme_minimal()
+
+plot(fig_ms_log_linear)
+ggsave("plots/multistep-ms-log-relationship.pdf",width=6,height=4)
+ggsave("plots/multistep-ms-log-relationship.png",width=6,height=4)
+
+```
+
+## Plot: Figure 2
+
+```{r figure2, fig.width = 8/2.54, fig.height = 12/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+figure_2 = cowplot::plot_grid(fig2_age_specific_incidence,
+                              fig2_log_linear,
+                              fig2_log_broken_stick, 
+                              #fig_ms_age_specific_incidence,
+                              #fig_ms_log_linear, 
+                              align = 'v',
+                              axis = 'bt', ncol = 1, scale=0.99)
+
+plot(figure_2)
+ggsave("plots/multistep-figure-2.pdf",width=4,height=7)
+ggsave("plots/multistep-figure-2.png",width=4,height=7)
+
+```
+
+## Plot: Figure 3
+
+```{r figure3, fig.width = 8/2.54, fig.height = 8/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+figure_3 = cowplot::plot_grid(fig2_age_sex_specific_incidence,
+                              fig2_log_sex, 
+                              align = 'v',
+                              axis = 'bt', ncol = 1,scale=0.99)
+
+plot(figure_3)
+ggsave("plots/multistep-figure-3.pdf",width=4,height=5)
+ggsave("plots/multistep-figure-3.png",width=4,height=5)
+
+```
+
+## Plot: Figure 4
+
+```{r figure4, fig.width = 10/2.54, fig.height = 20/2.54, fig.cap="", dev='png', dev.args=list(type='cairo')}
+
+figure_4 = cowplot::plot_grid(fig4_ad_sex,
+                              fig4_beta_sex,
+                              fig4_susceptibility_sex,
+                              align = 'v',
+                              axis = 'bt', ncol = 1)
+
+plot(figure_4)
+ggsave("plots/multistep-figure-4.pdf",width=4,height=8)
+ggsave("plots/multistep-figure-4.png",width=4,height=8)
+
+```

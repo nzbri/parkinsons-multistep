@@ -14,8 +14,8 @@ geometry: margin=2cm
 ```{r setup, include=FALSE}
 
 ## Needed to set CC=g++ so that could install reticulate
-#M <- file.path(Sys.getenv("HOME"), ".R", ifelse(.Platform$OS.type == "windows", "Makevars.win", "Makevars"))
-#file.edit(M)
+M <- file.path(Sys.getenv("HOME"), ".R", ifelse(.Platform$OS.type == "windows", "Makevars.win", "Makevars"))
+file.edit(M)
 #install.packages("reticulate")
 
 library(reticulate)

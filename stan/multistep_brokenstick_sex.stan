@@ -62,3 +62,14 @@ model {
     target += log(Phi((y_max[n] - y_pred[n]) / sigma)
                   - Phi((y_min[n] - y_pred[n]) / sigma));
 }
+
+generated quantities {
+  real c_female;
+  real m_early_female;
+  real m_late_female;
+  
+  c_female = c + c_sex;
+  m_early_female = m_early + m_sex;
+  m_late_female = m_late + m_sex;
+
+}

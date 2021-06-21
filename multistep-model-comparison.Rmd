@@ -22,6 +22,7 @@ library(bayesplot)
 library(bridgesampling)
 library(cowplot)
 library(forcats)
+library(rstanarm)
 
 color_scheme_set("brightblue")
 
@@ -115,14 +116,30 @@ print(fit_linear,prob=c(0.025,0.5,0.975))
 summary(fit_linear)$summary
 
 H_LINEAR = bridge_sampler(fit_linear)
+```
+
+```{r model_linear_simpler, message=FALSE}
 
 # Comparison with frequentist linear model using median of posterior age-specific
-# values. Not valid as doesn't take into account uncertainty of values which are 
-# important when working with the log-transformed data
-# 
-# summary(lm(middle_log~agecut5_scaled, data=sim_df_ms_model))
+# values. 
+
+summary(lm(middle_log~agecut5_scaled, data=sim_df_ms_model))
+
+# A Bayesian linear fit using the stan_glm function from the rstanarm library
+# Use to calculate a R2 of the linear model
+
+fit_linear_stan_glm <- stan_glm(
+  middle_log~agecut5_scaled,
+  data = sim_df_ms_model,
+  chains = 4,
+  refresh = 0
+)
+
+fit_linear_rsq <- bayes_R2(fit_linear_stan_glm)
+print(median(fit_linear_rsq))
 
 ```
+
 
 ## Model: Broken-stick
 
@@ -1250,7 +1267,7 @@ figure_2 = cowplot::plot_grid(fig2_age_specific_incidence,
 
 plot(figure_2)
 ggsave("plots/multistep-figure-2.pdf",width=4,height=7)
-ggsave("plots/multistep-figure-2.png",width=4,height=7)
+ggsave("plots/multistep-figure-2.png",width=4,height=7,dpi=1200)
 
 ```
 
@@ -1265,7 +1282,7 @@ figure_3 = cowplot::plot_grid(fig2_age_sex_specific_incidence,
 
 plot(figure_3)
 ggsave("plots/multistep-figure-3.pdf",width=4,height=5)
-ggsave("plots/multistep-figure-3.png",width=4,height=5)
+ggsave("plots/multistep-figure-3.png",width=4,height=5,dpi=1200)
 
 ```
 
@@ -1281,6 +1298,6 @@ figure_4 = cowplot::plot_grid(fig4_ad_sex,
 
 plot(figure_4)
 ggsave("plots/multistep-figure-4.pdf",width=4,height=8)
-ggsave("plots/multistep-figure-4.png",width=4,height=8)
+ggsave("plots/multistep-figure-4.png",width=4,height=8,dpi=1200)
 
 ```
